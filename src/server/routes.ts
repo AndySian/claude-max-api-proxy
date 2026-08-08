@@ -32,11 +32,12 @@ function resolveCliInput(body: OpenAIChatRequest): {
   sessionKey: string | undefined;
   resume: boolean;
 } {
-  // Default to a stable session key when the client (e.g. Hermes) doesn't
-  // send `user`. This enables --resume on subsequent turns, avoiding full
-  // history replay every request.
-  const sessionKey = body.user || "hermes-default-session";
-  const existing = getSession(sessionKey);
+  // Session resume requires a stable per-client identifier. Without `user`
+  // we have no way to distinguish callers, so skip resume entirely rather
+  // than fall back to a shared key that would cross-contaminate unrelated
+  // conversations.
+  const sessionKey = body.user;
+  const existing = sessionKey ? getSession(sessionKey) : undefined;
 
   if (existing) {
     const cliInput = openaiToCliDelta(body, existing.messageCount);
