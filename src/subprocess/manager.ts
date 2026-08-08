@@ -5,9 +5,10 @@
  * Uses spawn() instead of exec() to prevent shell injection vulnerabilities.
  */
 
-import { spawn, ChildProcess } from "child_process";
+import { spawn, spawnSync, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
 import fs from "fs/promises";
+import { readFileSync } from "fs";
 import path from "path";
 import type {
   ClaudeCliMessage,
@@ -29,6 +30,8 @@ import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 export interface SubprocessOptions {
   model: ClaudeModel;
   sessionId?: string;
+  /** Resume an existing persisted session (sessionId) instead of creating a new one */
+  resume?: boolean;
   cwd?: string;
   timeout?: number;
 }
@@ -88,6 +91,59 @@ const OPENCLAW_TOOL_MAPPING_PROMPT = [
   "Run `openclaw skills list --eligible --json` to see all available skills.",
 ].join("\n");
 
+/**
+ * Resolve the real Claude CLI binary to spawn.
+ *
+ * On Windows, the global `claude` command is an npm shim (`claude.cmd`) that
+ * just execs a bundled `claude.exe`. Running the shim requires `shell: true`,
+ * which routes our argv through cmd.exe — and cmd.exe treats characters our
+ * appended system prompt legitimately contains (`<`, `>`, `(`, `)`, `&`) as
+ * redirection/grouping/chaining operators, corrupting the argument list that
+ * follows (notably `--session-id`/`--resume`, which silently stop working).
+ * Resolving straight to the `.exe` lets us spawn with `shell: false` and
+ * skip cmd.exe entirely. Falls back to the shim (with shell:true) if the
+ * `.exe` can't be located.
+ */
+let resolvedClaudeBin: { bin: string; shell: boolean } | null = null;
+
+function resolveClaudeBin(): { bin: string; shell: boolean } {
+  if (resolvedClaudeBin) return resolvedClaudeBin;
+
+  if (process.env.CLAUDE_BIN) {
+    resolvedClaudeBin = { bin: process.env.CLAUDE_BIN, shell: false };
+    return resolvedClaudeBin;
+  }
+
+  if (process.platform === "win32") {
+    try {
+      const where = spawnSync("where.exe", ["claude"], { encoding: "utf8" });
+      const shimPath = (where.stdout || "")
+        .split(/\r?\n/)
+        .map((p) => p.trim())
+        .find((p) => p.toLowerCase().endsWith(".cmd"));
+
+      if (shimPath) {
+        const shimDir = path.dirname(shimPath);
+        const shimContent = readFileSync(shimPath, "utf8");
+        const match = shimContent.match(/"%dp0%\\(.+?\.exe)"/i);
+        if (match) {
+          const exePath = path.join(shimDir, match[1]);
+          resolvedClaudeBin = { bin: exePath, shell: false };
+          return resolvedClaudeBin;
+        }
+      }
+    } catch {
+      // Fall through to shim fallback below
+    }
+
+    resolvedClaudeBin = { bin: "claude", shell: true };
+    return resolvedClaudeBin;
+  }
+
+  resolvedClaudeBin = { bin: "claude", shell: false };
+  return resolvedClaudeBin;
+}
+
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer: string = "";
@@ -100,16 +156,22 @@ export class ClaudeSubprocess extends EventEmitter {
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
     const args = this.buildArgs(options);
     const timeout = options.timeout || DEFAULT_TIMEOUT;
+    if (process.env.DEBUG_SUBPROCESS) {
+      console.error(`[Subprocess] args: ${JSON.stringify(args)}`);
+      console.error(`[Subprocess] prompt: ${prompt.slice(0, 200)}`);
+    }
 
     return new Promise((resolve, reject) => {
       try {
         // Use spawn() for security - no shell interpretation
-        this.process = spawn(process.env.CLAUDE_BIN || "claude", args, {
+        const { bin, shell } = resolveClaudeBin();
+        this.process = spawn(bin, args, {
           cwd: options.cwd || process.cwd(),
           env: Object.fromEntries(
             Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
           ),
           stdio: ["pipe", "pipe", "pipe"],
+          shell,
         });
 
         // Set timeout
@@ -200,14 +262,22 @@ export class ClaudeSubprocess extends EventEmitter {
       "--include-partial-messages", // Enable streaming chunks
       "--model",
       options.model, // Model alias (opus/sonnet/haiku)
-      "--no-session-persistence", // Don't save sessions
       "--append-system-prompt",
       OPENCLAW_TOOL_MAPPING_PROMPT,
       // Prompt is passed via stdin (avoids E2BIG on large inputs)
     ];
 
-    if (options.sessionId) {
+    if (options.sessionId && options.resume) {
+      // Continue a previously persisted session — avoids replaying full history
+      args.push("--resume", options.sessionId);
+    } else if (options.sessionId) {
+      // First turn for this session key — create it under a known ID so we
+      // can --resume it on subsequent turns
       args.push("--session-id", options.sessionId);
+    } else {
+      // No stable session key (e.g. request.user missing) — don't leave
+      // orphaned session files behind
+      args.push("--no-session-persistence");
     }
 
     return args;
@@ -294,7 +364,8 @@ export class ClaudeSubprocess extends EventEmitter {
  */
 export async function verifyClaude(): Promise<{ ok: boolean; error?: string; version?: string }> {
   return new Promise((resolve) => {
-    const proc = spawn(process.env.CLAUDE_BIN || "claude", ["--version"], { stdio: "pipe" });
+    const { bin, shell } = resolveClaudeBin();
+    const proc = spawn(bin, ["--version"], { stdio: "pipe", shell });
     let output = "";
 
     proc.stdout?.on("data", (chunk: Buffer) => {
