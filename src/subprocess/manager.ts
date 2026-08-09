@@ -107,12 +107,13 @@ const OPENCLAW_TOOL_MAPPING_PROMPT = [
 let resolvedClaudeBin: { bin: string; shell: boolean } | null = null;
 
 function resolveClaudeBin(): { bin: string; shell: boolean } {
-  if (resolvedClaudeBin) return resolvedClaudeBin;
-
   if (process.env.CLAUDE_BIN) {
-    resolvedClaudeBin = { bin: process.env.CLAUDE_BIN, shell: false };
-    return resolvedClaudeBin;
+    // Environment overrides are intentionally not cached. This lets callers
+    // temporarily select a binary without contaminating later resolutions.
+    return { bin: process.env.CLAUDE_BIN, shell: false };
   }
+
+  if (resolvedClaudeBin) return resolvedClaudeBin;
 
   if (process.platform === "win32") {
     try {
@@ -142,6 +143,52 @@ function resolveClaudeBin(): { bin: string; shell: boolean } {
 
   resolvedClaudeBin = { bin: "claude", shell: false };
   return resolvedClaudeBin;
+}
+
+/**
+ * Kill a process and its full descendant tree.
+ *
+ * `ChildProcess.kill()` only signals the direct child. On Windows this is
+ * insufficient because the Claude CLI spawns its own subprocesses (e.g. for
+ * Bash tool calls) that aren't part of a job object — killing just the
+ * parent leaves them running in the background even after a client
+ * disconnect or timeout. `taskkill /T` walks the whole tree instead.
+ */
+function killProcessTree(
+  child: ChildProcess,
+  signal: NodeJS.Signals = "SIGTERM"
+): boolean {
+  const pid = child.pid;
+  if (!pid) return false;
+
+  if (process.platform === "win32") {
+    const taskkill = process.env.SystemRoot
+      ? path.join(process.env.SystemRoot, "System32", "taskkill.exe")
+      : "taskkill.exe";
+    const result = spawnSync(taskkill, ["/PID", String(pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    if (!result.error && result.status === 0) {
+      return true;
+    }
+
+    // If taskkill could not be started or rejected the request, still make a
+    // best-effort attempt to stop the managed root process. This must not be
+    // reported as a successful tree termination: descendants may still be
+    // running, and callers must remain able to retry.
+    try {
+      child.kill(signal);
+    } catch {}
+    return false;
+  }
+
+  try {
+    return child.kill(signal);
+  } catch {
+    // Process may have already exited
+    return false;
+  }
 }
 
 export class ClaudeSubprocess extends EventEmitter {
@@ -174,14 +221,7 @@ export class ClaudeSubprocess extends EventEmitter {
           shell,
         });
 
-        // Set timeout
-        this.timeoutId = setTimeout(() => {
-          if (!this.isKilled) {
-            this.isKilled = true;
-            this.process?.kill("SIGTERM");
-            this.emit("error", new Error(`Request timed out after ${timeout}ms`));
-          }
-        }, timeout);
+        this.armTimeout(timeout);
 
         // Handle spawn errors (e.g., claude not found)
         this.process.on("error", (err) => {
@@ -345,10 +385,25 @@ export class ClaudeSubprocess extends EventEmitter {
    */
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
     if (!this.isKilled && this.process) {
-      this.isKilled = true;
       this.clearTimeout();
-      this.process.kill(signal);
+      this.isKilled = killProcessTree(this.process, signal);
     }
+  }
+
+  /**
+   * Arm the request timeout. Kept narrow so tests can deterministically re-arm
+   * the production timeout behavior after their fixture process tree is ready.
+   */
+  private armTimeout(timeout: number): void {
+    this.clearTimeout();
+    this.timeoutId = setTimeout(() => {
+      if (!this.isKilled) {
+        if (this.process) {
+          this.isKilled = killProcessTree(this.process, "SIGTERM");
+        }
+        this.emit("error", new Error(`Request timed out after ${timeout}ms`));
+      }
+    }, timeout);
   }
 
   /**
